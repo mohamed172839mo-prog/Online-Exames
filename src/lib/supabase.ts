@@ -46,7 +46,9 @@ export interface ExamSettings {
   id?: number | string;
   exam_title?: string;
   is_enabled: boolean;
+  is_locked?: boolean;
   exam_start_time?: string | null;
+  exam_end_time?: string | null;
   allowed_entry_window_minutes: number;
   updated_at?: string;
 }

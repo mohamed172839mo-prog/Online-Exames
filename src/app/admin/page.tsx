@@ -34,7 +34,10 @@ import {
   GraduationCap,
   RotateCcw,
   ShieldAlert,
-  Sparkles
+  Sparkles,
+  Edit3,
+  X,
+  Filter
 } from 'lucide-react';
 
 export default function AdminDashboard() {
@@ -52,12 +55,27 @@ export default function AdminDashboard() {
   const [copiedSql, setCopiedSql] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Leaderboard Exam Title Filter State
+  const [selectedExamFilter, setSelectedExamFilter] = useState<string>('ALL');
+
+  // Inline Question Time Limit Editing State
+  const [editingTimeLimitId, setEditingTimeLimitId] = useState<string | null>(null);
+  const [tempTimeLimit, setTempTimeLimit] = useState<number>(60);
+  const [isSavingTimeLimit, setIsSavingTimeLimit] = useState(false);
+  const [saveTimeSuccessId, setSaveTimeSuccessId] = useState<string | null>(null);
+
+  // Realtime Live Presence Counters (Waiting vs Testing)
+  const [waitingStudentsCount, setWaitingStudentsCount] = useState(0);
+  const [testingStudentsCount, setTestingStudentsCount] = useState(0);
+
   // Exam Scheduling & Settings State
   const [examSettings, setExamSettings] = useState<ExamSettings>({
     id: 1,
     exam_title: 'اختبار تقييم المستوى',
     is_enabled: true,
+    is_locked: false,
     exam_start_time: null,
+    exam_end_time: null,
     allowed_entry_window_minutes: 10,
   });
   const [isSavingSettings, setIsSavingSettings] = useState(false);
@@ -106,6 +124,8 @@ create table if not exists public.exam_settings (
 alter table public.exam_results add column if not exists exam_title text default 'اختبار تقييم المستوى';
 alter table public.exam_results add column if not exists allow_retake boolean not null default false;
 alter table public.exam_settings add column if not exists exam_title text default 'اختبار تقييم المستوى';
+alter table public.exam_settings add column if not exists is_locked boolean not null default false;
+alter table public.exam_settings add column if not exists exam_end_time text;
 
 alter table public.questions enable row level security;
 alter table public.exam_results enable row level security;
@@ -161,6 +181,31 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
     }
   };
 
+  // Realtime Live Presence: Subscribe to examinees presence ('waiting' vs 'testing')
+  useEffect(() => {
+    const channel = supabase.channel('exam_live_presence');
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        const state = channel.presenceState();
+        let waiting = 0;
+        let testing = 0;
+        Object.values(state).forEach((presences: any) => {
+          presences.forEach((p: any) => {
+            if (p.status === 'waiting') waiting++;
+            else if (p.status === 'testing') testing++;
+          });
+        });
+        setWaitingStudentsCount(waiting);
+        setTestingStudentsCount(testing);
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
   const fetchSettings = async () => {
     try {
       const { data, error } = await supabase
@@ -174,7 +219,9 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
           id: 1,
           exam_title: data.exam_title || 'اختبار تقييم المستوى',
           is_enabled: data.is_enabled ?? true,
+          is_locked: data.is_locked ?? false,
           exam_start_time: data.exam_start_time || null,
+          exam_end_time: data.exam_end_time || null,
           allowed_entry_window_minutes: data.allowed_entry_window_minutes || 10,
         });
         if (typeof window !== 'undefined') {
@@ -212,7 +259,9 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
       id: 1,
       exam_title: examSettings.exam_title || 'اختبار تقييم المستوى',
       is_enabled: examSettings.is_enabled,
+      is_locked: examSettings.is_locked ?? false,
       exam_start_time: examSettings.exam_start_time ? new Date(examSettings.exam_start_time).toISOString() : null,
+      exam_end_time: examSettings.exam_end_time ? new Date(examSettings.exam_end_time).toISOString() : null,
       allowed_entry_window_minutes: Number(examSettings.allowed_entry_window_minutes) || 10,
       updated_at: new Date().toISOString(),
     };
@@ -240,6 +289,56 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
     } finally {
       setIsSavingSettings(false);
       setTimeout(() => setSettingsSaveNotice(null), 5000);
+    }
+  };
+
+  // Quick Lock Exam Entry Toggle
+  const handleToggleExamLock = async () => {
+    const newLockState = !examSettings.is_locked;
+    const updated = { ...examSettings, is_locked: newLockState };
+    setExamSettings(updated);
+
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('online_exam_settings', JSON.stringify(updated));
+    }
+
+    try {
+      await supabase
+        .from('exam_settings')
+        .upsert({
+          id: 1,
+          is_locked: newLockState,
+          updated_at: new Date().toISOString(),
+        });
+      setSuccessMessage(newLockState ? 'تم قفل باب الدخول للاختبار بنجاح.' : 'تم فتح باب الدخول للاختبار.');
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err: any) {
+      console.warn('Lock update notice:', err);
+    }
+  };
+
+  // Direct Question Time Limit Editing Handler
+  const handleSaveTimeLimit = async (questionId: string, newLimit: number) => {
+    if (isNaN(newLimit) || newLimit <= 0) return;
+    setIsSavingTimeLimit(true);
+    try {
+      const { error } = await supabase
+        .from('questions')
+        .update({ time_limit: newLimit })
+        .eq('id', questionId);
+
+      if (error) throw error;
+
+      setQuestions((prev) =>
+        prev.map((q) => (q.id === questionId ? { ...q, time_limit: newLimit } : q))
+      );
+      setSaveTimeSuccessId(questionId);
+      setTimeout(() => setSaveTimeSuccessId(null), 2500);
+      setEditingTimeLimitId(null);
+    } catch (err: any) {
+      alert('Failed to update question time limit: ' + (err.message || 'Unknown error'));
+    } finally {
+      setIsSavingTimeLimit(false);
     }
   };
 
@@ -348,15 +447,81 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
     }
   };
 
+  // Unique Exam Titles for filter dropdown
+  const uniqueExamTitles = Array.from(
+    new Set(
+      results
+        .map((r) => r.exam_title?.trim())
+        .filter((t): t is string => Boolean(t && t.length > 0))
+    )
+  );
+
+  // Group results by exam to compute accurate, dynamic per-exam ranks (Rank 1..N per exam)
+  const examRankMap = new Map<string, number>();
+  const examGroups: Record<string, ExamResult[]> = {};
+
+  results.forEach((r) => {
+    const titleKey = (r.exam_title || 'اختبار تقييم المستوى').trim();
+    if (!examGroups[titleKey]) examGroups[titleKey] = [];
+    examGroups[titleKey].push(r);
+  });
+
+  Object.values(examGroups).forEach((group) => {
+    const sorted = [...group].sort((a, b) => {
+      if (b.total_score !== a.total_score) return b.total_score - a.total_score;
+      if (b.correct_answers_count !== a.correct_answers_count) {
+        return b.correct_answers_count - a.correct_answers_count;
+      }
+      return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
+    });
+
+    sorted.forEach((item, index) => {
+      if (item.id) {
+        examRankMap.set(item.id, index + 1);
+      } else {
+        const key = `${item.student_phone}_${item.exam_title}_${item.created_at}`;
+        examRankMap.set(key, index + 1);
+      }
+    });
+  });
+
+  // Filter results by selected exam title and search term
+  const filteredResults = results
+    .filter((r) => {
+      const title = (r.exam_title || 'اختبار تقييم المستوى').trim();
+      if (selectedExamFilter !== 'ALL' && title !== selectedExamFilter) {
+        return false;
+      }
+
+      if (resultsSearchTerm.trim()) {
+        const term = resultsSearchTerm.toLowerCase();
+        return (
+          r.student_name?.toLowerCase().includes(term) ||
+          r.student_phone?.toLowerCase().includes(term) ||
+          (r.exam_title && r.exam_title.toLowerCase().includes(term))
+        );
+      }
+
+      return true;
+    })
+    .sort((a, b) => {
+      if (b.total_score !== a.total_score) return b.total_score - a.total_score;
+      if (b.correct_answers_count !== a.correct_answers_count) {
+        return b.correct_answers_count - a.correct_answers_count;
+      }
+      return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
+    });
+
   // CSV Export Feature for Student Results
   const handleExportResultsCsv = () => {
-    if (results.length === 0) {
+    const listToExport = filteredResults.length > 0 ? filteredResults : results;
+    if (listToExport.length === 0) {
       alert('لا توجد نتائج مسجلة لتصديرها حالياً.');
       return;
     }
 
     const headers = [
-      'الترتيب (Rank)',
+      'الترتيب (Rank in Exam)',
       'اسم الطالب (Student Name)',
       'رقم الهاتف (Phone Number)',
       'عنوان الاختبار (Exam Title)',
@@ -368,7 +533,7 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
       'تاريخ ووقت التسليم (Submission Date)'
     ];
 
-    const rows = results.map((r, idx) => {
+    const rows = listToExport.map((r, idx) => {
       const escapeCsv = (val: string | number | undefined | null) => {
         if (val === undefined || val === null) return '""';
         const str = String(val).replace(/"/g, '""');
@@ -383,8 +548,10 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
         ? `${r.percentage}%`
         : `${Math.round(((r.correct_answers_count || 0) / (r.total_questions || 1)) * 100)}%`;
 
+      const rank = idx + 1;
+
       return [
-        idx + 1,
+        rank,
         escapeCsv(r.student_name),
         escapeCsv(r.student_phone),
         escapeCsv(r.exam_title || examSettings.exam_title || 'اختبار تقييم المستوى'),
@@ -402,7 +569,7 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    const examSlug = (examSettings.exam_title || 'exam_results')
+    const examSlug = (selectedExamFilter !== 'ALL' ? selectedExamFilter : examSettings.exam_title || 'exam_results')
       .replace(/[^\w\u0600-\u06FF]+/g, '_')
       .slice(0, 30);
     const filename = `${examSlug}_${new Date().toISOString().slice(0, 10)}.csv`;
@@ -413,7 +580,7 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
 
-    setSuccessMessage(`تم تصدير ملف النتائج بنجاح (${results.length} طالب/طالبة).`);
+    setSuccessMessage(`تم تصدير ملف النتائج بنجاح (${listToExport.length} طالب/طالبة).`);
   };
 
   // Simplified Timing UI Helpers
@@ -678,15 +845,6 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
     );
   });
 
-  const filteredResults = results.filter((r) => {
-    const term = resultsSearchTerm.toLowerCase();
-    return (
-      r.student_name?.toLowerCase().includes(term) ||
-      r.student_phone?.toLowerCase().includes(term) ||
-      (r.exam_title && r.exam_title.toLowerCase().includes(term))
-    );
-  });
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 text-slate-100 p-3 sm:p-6 md:p-8 font-sans">
       <div className="max-w-7xl mx-auto space-y-6">
@@ -768,6 +926,76 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
             )}
           </div>
         </header>
+
+        {/* Realtime Live Examinees Bar & Lock Entry Feature */}
+        <div className="bg-slate-800/70 backdrop-blur-xl border border-white/10 rounded-2xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4 shadow-xl">
+          <div className="flex flex-wrap items-center gap-3 w-full sm:w-auto">
+            {/* Live Counter 1: Waiting Room */}
+            <div className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300">
+              <div className="relative flex items-center justify-center">
+                <Users className="w-4 h-4 text-amber-400" />
+                <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+              </div>
+              <div>
+                <div className="text-[10px] text-amber-400/90 font-medium">قاعة الانتظار (Waiting)</div>
+                <div className="text-sm font-bold font-mono text-white flex items-center gap-1.5">
+                  <span>{waitingStudentsCount}</span>
+                  <span className="text-[10px] font-normal text-amber-300">طالب جاهز</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Live Counter 2: Actively Testing */}
+            <div className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">
+              <div className="relative flex items-center justify-center">
+                <Zap className="w-4 h-4 text-emerald-400 fill-emerald-400" />
+                <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+              </div>
+              <div>
+                <div className="text-[10px] text-emerald-400/90 font-medium">أثناء الاختبار (Testing)</div>
+                <div className="text-sm font-bold font-mono text-white flex items-center gap-1.5">
+                  <span>{testingStudentsCount}</span>
+                  <span className="text-[10px] font-normal text-emerald-300">طالب نشط</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Quick Lock Entry Toggle Button */}
+          <div className="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 pt-2 sm:pt-0 border-white/5">
+            <div className="text-right">
+              <div className="text-xs font-semibold text-white flex items-center gap-1.5 justify-end">
+                {examSettings.is_locked ? <Lock className="w-3.5 h-3.5 text-rose-400" /> : <Unlock className="w-3.5 h-3.5 text-emerald-400" />}
+                <span>{examSettings.is_locked ? 'باب الدخول مغلق (Locked)' : 'باب الدخول مفتوح (Unlocked)'}</span>
+              </div>
+              <p className="text-[10px] text-slate-400">
+                {examSettings.is_locked ? 'يمنع أي طالب جديد من بدء الامتحان' : 'مسموح للطلاب بالدخول وبدء الامتحان'}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleToggleExamLock}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-lg shrink-0 ${
+                examSettings.is_locked
+                  ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-600/30'
+                  : 'bg-slate-700/80 hover:bg-slate-700 text-slate-200 border border-white/10'
+              }`}
+            >
+              {examSettings.is_locked ? (
+                <>
+                  <Unlock className="w-3.5 h-3.5" />
+                  <span>فتح باب الدخول</span>
+                </>
+              ) : (
+                <>
+                  <Lock className="w-3.5 h-3.5 text-rose-400" />
+                  <span>قفل باب الدخول</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
 
         {/* Tab Switcher */}
         <div className="flex flex-wrap items-center gap-2 p-1.5 rounded-2xl bg-slate-900/80 border border-white/10 w-fit">
@@ -1078,10 +1306,66 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
                         </span>
                       </td>
                       <td className="py-3.5 px-4 text-center">
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900/80 text-blue-300 border border-slate-700/60 font-mono text-[11px]">
-                          <Clock className="w-3 h-3 text-blue-400" />
-                          {q.time_limit}s
-                        </span>
+                        {editingTimeLimitId === q.id ? (
+                          <div className="inline-flex items-center gap-1 justify-center">
+                            <input
+                              type="number"
+                              min="5"
+                              max="600"
+                              value={tempTimeLimit}
+                              onChange={(e) => setTempTimeLimit(parseInt(e.target.value) || 10)}
+                              className="w-14 bg-slate-900 border border-emerald-500 rounded-lg px-1.5 py-1 text-xs text-white font-mono text-center focus:outline-none"
+                              autoFocus
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleSaveTimeLimit(q.id!, tempTimeLimit);
+                                if (e.key === 'Escape') setEditingTimeLimitId(null);
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleSaveTimeLimit(q.id!, tempTimeLimit)}
+                              disabled={isSavingTimeLimit}
+                              className="p-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white transition disabled:opacity-50"
+                              title="Save time limit"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingTimeLimitId(null)}
+                              className="p-1 rounded-md bg-slate-700 hover:bg-slate-600 text-slate-300 transition"
+                              title="Cancel"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="inline-flex items-center gap-1.5 justify-center">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-900/80 text-blue-300 border border-slate-700/60 font-mono text-[11px]">
+                              <Clock className="w-3 h-3 text-blue-400" />
+                              {q.time_limit}s
+                            </span>
+                            {saveTimeSuccessId === q.id ? (
+                              <span className="text-emerald-400 text-[10px] font-bold animate-in fade-in flex items-center gap-0.5">
+                                <CheckCircle2 className="w-3 h-3" /> تم الحفظ!
+                              </span>
+                            ) : (
+                              q.id && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingTimeLimitId(q.id!);
+                                    setTempTimeLimit(q.time_limit || 60);
+                                  }}
+                                  className="p-1 rounded text-slate-400 hover:text-emerald-300 hover:bg-emerald-500/10 transition"
+                                  title="Directly edit question time limit (seconds)"
+                                >
+                                  <Edit3 className="w-3 h-3" />
+                                </button>
+                              )
+                            )}
+                          </div>
+                        )}
                       </td>
                       <td className="py-3.5 px-4 text-center">
                         {q.id && (
@@ -1148,60 +1432,79 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
 
             {/* Leaderboard Table Container */}
             <div className="bg-slate-800/80 backdrop-blur-xl border border-white/10 rounded-2xl shadow-xl overflow-hidden">
-              <div className="p-4 sm:p-6 border-b border-white/10 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Trophy className="w-5 h-5 text-amber-400" />
-                    <h3 className="font-semibold text-white">Student Results & Retake Management</h3>
-                    <span className="text-xs px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-mono">
-                      {results.length} examinees
-                    </span>
+              <div className="p-3.5 sm:p-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center shrink-0">
+                    <Trophy className="w-4 h-4 text-amber-400" />
                   </div>
-                  <p className="text-xs text-slate-400 mt-1">Manage single-attempt locks, override restrictions, and grant retake permissions</p>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-semibold text-white text-sm">Student Results & Retake Management</h3>
+                      <span className="text-xs px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-mono font-medium">
+                        {results.length} examinees
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400">Manage candidate attempts, search scores, and export records</p>
+                  </div>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2.5">
-                  <button
-                    type="button"
-                    onClick={handleExportResultsCsv}
-                    disabled={results.length === 0}
-                    className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/30 transition disabled:opacity-50 touch-manipulation"
-                    title="تصدير كشف نتائج جميع الطلاب إلى ملف CSV للتحميل الفوري"
+                {/* Inline Controls Row */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative w-44 sm:w-56">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                    <input
+                      type="text"
+                      placeholder="Search name, phone..."
+                      value={resultsSearchTerm}
+                      onChange={(e) => setResultsSearchTerm(e.target.value)}
+                      className="w-full bg-slate-900/90 border border-slate-700 rounded-xl py-1.5 pl-8 pr-3 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 font-medium"
+                    />
+                  </div>
+
+                  <select
+                    value={selectedExamFilter}
+                    onChange={(e) => setSelectedExamFilter(e.target.value)}
+                    className="bg-slate-900 border border-slate-700 rounded-xl py-1.5 px-2.5 text-xs text-white focus:outline-none focus:border-purple-500 font-medium cursor-pointer max-w-[170px] truncate"
+                    title="Filter Leaderboard by Exam Title"
                   >
-                    <Download className="w-4 h-4 text-white" />
-                    <span>تصدير الدرجات CSV</span>
-                  </button>
+                    <option value="ALL">🌐 All Exams</option>
+                    {uniqueExamTitles.map((title) => (
+                      <option key={title} value={title}>
+                        🎓 {title}
+                      </option>
+                    ))}
+                  </select>
 
                   <button
                     type="button"
                     onClick={() => handleAllowAllRetakes(true)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/30 text-emerald-300 text-xs font-semibold transition"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/30 text-emerald-300 text-xs font-semibold transition"
                     title="Allow all recorded examinees to retake the test"
                   >
                     <Unlock className="w-3.5 h-3.5" />
-                    <span>Allow All Retakes</span>
+                    <span>Allow All</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => handleAllowAllRetakes(false)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-300 text-xs font-semibold transition"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-300 text-xs font-semibold transition"
                     title="Lock all examinees to single attempt"
                   >
                     <Lock className="w-3.5 h-3.5" />
                     <span>Lock All</span>
                   </button>
 
-                  <div className="relative w-full sm:w-64">
-                    <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                    <input
-                      type="text"
-                      placeholder="Search name, phone, or exam..."
-                      value={resultsSearchTerm}
-                      onChange={(e) => setResultsSearchTerm(e.target.value)}
-                      className="w-full bg-slate-900/90 border border-slate-700 rounded-xl py-2 pl-9 pr-4 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 focus:ring-1 focus:ring-purple-500"
-                    />
-                  </div>
+                  <button
+                    type="button"
+                    onClick={handleExportResultsCsv}
+                    disabled={results.length === 0}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-sm shadow-emerald-600/30 transition disabled:opacity-50 touch-manipulation"
+                    title="تصدير كشف نتائج جميع الطلاب إلى ملف CSV للتحميل الفوري"
+                  >
+                    <Download className="w-3.5 h-3.5 text-white" />
+                    <span>تصدير الدرجات CSV</span>
+                  </button>
                 </div>
               </div>
 
@@ -1227,65 +1530,70 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
                   <table className="w-full text-left border-collapse">
                     <thead>
                       <tr className="border-b border-white/10 bg-slate-900/60 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                        <th className="py-3 px-4 w-14 text-center">Rank</th>
-                        <th className="py-3 px-4 min-w-[170px]">Candidate</th>
-                        <th className="py-3 px-4 min-w-[150px]">Exam Title</th>
-                        <th className="py-3 px-4 min-w-[120px]">Score</th>
-                        <th className="py-3 px-4 text-center min-w-[110px]">Correct</th>
-                        <th className="py-3 px-4 text-center min-w-[90px]">Accuracy</th>
-                        <th className="py-3 px-4 text-center min-w-[140px]">Retake Status</th>
-                        <th className="py-3 px-4 text-center min-w-[110px]">Date</th>
-                        <th className="py-3 px-4 text-center min-w-[150px]">Actions</th>
+                        <th className="py-3 px-3 w-14 text-center">Rank</th>
+                        <th className="py-3 px-3 min-w-[150px]">Candidate</th>
+                        <th className="py-3 px-3 min-w-[140px]">Exam Title</th>
+                        <th className="py-3 px-3 text-center min-w-[95px]">Score</th>
+                        <th className="py-3 px-3 text-center min-w-[85px]">Correct</th>
+                        <th className="py-3 px-3 text-center min-w-[80px]">Accuracy</th>
+                        <th className="py-3 px-3 text-center min-w-[125px]">Retake Status</th>
+                        <th className="py-3 px-3 text-center min-w-[85px]">Date</th>
+                        <th className="py-3 px-3 text-center min-w-[125px]">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/5 text-xs text-slate-300">
-                      {filteredResults.map((r, idx) => (
+                      {filteredResults.map((r, idx) => {
+                        const rank = idx + 1;
+
+                        return (
                         <tr key={r.id || idx} className="hover:bg-slate-700/20 transition">
-                          <td className="py-3.5 px-4 text-center font-bold">
-                            {idx === 0 ? (
-                              <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 text-sm shadow">
+                          <td className="py-3.5 px-3 text-center font-bold">
+                            {rank === 1 ? (
+                              <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 text-sm shadow" title="المركز الأول">
                                 🥇
                               </span>
-                            ) : idx === 1 ? (
-                              <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-slate-400/20 text-slate-200 border border-slate-400/40 text-sm shadow">
+                            ) : rank === 2 ? (
+                              <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-slate-400/20 text-slate-200 border border-slate-400/40 text-sm shadow" title="المركز الثاني">
                                 🥈
                               </span>
-                            ) : idx === 2 ? (
-                              <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-700/20 text-amber-500 border border-amber-700/40 text-sm shadow">
+                            ) : rank === 3 ? (
+                              <span className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-amber-700/20 text-amber-500 border border-amber-700/40 text-sm shadow" title="المركز الثالث">
                                 🥉
                               </span>
                             ) : (
-                              <span className="font-mono text-slate-500">#{idx + 1}</span>
+                              <span className="font-mono text-slate-400 font-bold">
+                                <bdi dir="ltr">#{rank}</bdi>
+                              </span>
                             )}
                           </td>
-                          <td className="py-3.5 px-4">
+                          <td className="py-3.5 px-3">
                             <div className="font-semibold text-white text-sm">{r.student_name}</div>
                             <div className="text-slate-400 text-[11px] font-mono mt-0.5">{r.student_phone}</div>
                           </td>
-                          <td className="py-3.5 px-4">
+                          <td className="py-3.5 px-3">
                             <span className="inline-flex items-center gap-1 text-xs text-slate-200 font-medium truncate max-w-[160px]" title={r.exam_title || 'General Exam'}>
                               <GraduationCap className="w-3.5 h-3.5 text-blue-400 shrink-0" />
                               <span className="truncate">{r.exam_title || 'اختبار تقييم المستوى'}</span>
                             </span>
                           </td>
-                          <td className="py-3.5 px-4">
+                          <td className="py-3.5 px-3 text-center">
                             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-purple-500/20 text-purple-300 border border-purple-500/40 font-bold text-xs font-mono">
                               <Zap className="w-3 h-3 text-amber-400 fill-amber-400" />
-                              {r.total_score} PTS
+                              <bdi dir="ltr">{r.total_score} PTS</bdi>
                             </span>
                           </td>
-                          <td className="py-3.5 px-4 text-center">
+                          <td className="py-3.5 px-3 text-center">
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 font-semibold font-mono text-xs">
                               <CheckCircle2 className="w-3 h-3" />
-                              {r.correct_answers_count} / {r.total_questions}
+                              <bdi dir="ltr">{r.correct_answers_count} / {r.total_questions}</bdi>
                             </span>
                           </td>
-                          <td className="py-3.5 px-4 text-center">
+                          <td className="py-3.5 px-3 text-center">
                             <span className="font-mono font-bold text-white text-xs">
-                              {r.percentage !== undefined ? `${r.percentage}%` : `${Math.round((r.correct_answers_count / (r.total_questions || 1)) * 100)}%`}
+                              <bdi dir="ltr">{r.percentage !== undefined ? `${r.percentage}%` : `${Math.round((r.correct_answers_count / (r.total_questions || 1)) * 100)}%`}</bdi>
                             </span>
                           </td>
-                          <td className="py-3.5 px-4 text-center">
+                          <td className="py-3.5 px-3 text-center">
                             {r.allow_retake ? (
                               <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-semibold text-[11px]">
                                 <Unlock className="w-3 h-3 text-emerald-400" />
@@ -1298,10 +1606,10 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
                               </span>
                             )}
                           </td>
-                          <td className="py-3.5 px-4 text-center text-slate-400 font-mono text-[11px]">
+                          <td className="py-3.5 px-3 text-center text-slate-400 font-mono text-[11px]">
                             {r.created_at ? new Date(r.created_at).toLocaleDateString() : 'Recent'}
                           </td>
-                          <td className="py-3.5 px-4 text-center">
+                          <td className="py-3.5 px-3 text-center">
                             <div className="inline-flex items-center justify-center gap-1.5">
                               {/* Toggle Allow Retake */}
                               <button
@@ -1337,7 +1645,8 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
                             </div>
                           </td>
                         </tr>
-                      ))}
+                      );
+                    })}
                     </tbody>
                   </table>
                 )}
@@ -1467,6 +1776,34 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
                       <span
                         className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
                           examSettings.is_enabled ? 'translate-x-7' : 'translate-x-0'
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {/* Lock Exam Entry Switch */}
+                  <div className="bg-slate-900/60 border border-white/10 rounded-xl p-4 flex items-center justify-between">
+                    <div className="space-y-1 pr-4">
+                      <label className="text-sm font-semibold text-white flex items-center gap-2">
+                        {examSettings.is_locked ? <Lock className="w-4 h-4 text-rose-400" /> : <Unlock className="w-4 h-4 text-emerald-400" />}
+                        <span>Lock Exam Entry (قفل باب الدخول للامتحان)</span>
+                      </label>
+                      <p className="text-xs text-slate-400">
+                        {examSettings.is_locked
+                          ? 'باب الدخول مقفل حالياً. يُمنع أي طالب جديد من بدء الامتحان ويظهر له تنبيه إغلاق باب الدخول.'
+                          : 'باب الدخول مفتوح للممتحنين وفقاً للجدول الزمني.'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setExamSettings((prev) => ({ ...prev, is_locked: !prev.is_locked }))}
+                      className={`relative inline-flex h-7 w-14 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+                        examSettings.is_locked ? 'bg-rose-500' : 'bg-slate-700'
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow-lg ring-0 transition duration-200 ease-in-out ${
+                          examSettings.is_locked ? 'translate-x-7' : 'translate-x-0'
                         }`}
                       />
                     </button>
@@ -1648,6 +1985,68 @@ create policy "Allow anon all on exam_settings" on public.exam_settings for all 
                     <p className="text-xs text-slate-400 leading-relaxed">
                       Students must click &quot;ابدأ الاختبار&quot; within this duration after start time. Once the window expires, new entries are locked.
                     </p>
+                  </div>
+
+                  {/* 5. Strict Cutoff / End Time Configuration */}
+                  <div className="space-y-3 bg-slate-900/60 border border-white/10 rounded-2xl p-4 sm:p-5">
+                    <div className="flex items-center justify-between flex-wrap gap-2 pb-2 border-b border-white/10">
+                      <div className="flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-purple-400" />
+                        <label className="text-xs font-semibold uppercase tracking-wider text-slate-200">
+                          Strict Exam Cutoff & Auto-Submit (توقيت الإنهاء الحتمي)
+                        </label>
+                      </div>
+                      <div className="text-xs text-purple-300 font-mono">
+                        {examSettings.exam_end_time
+                          ? `Cutoff: ${new Date(examSettings.exam_end_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                          : '⚡ Disabled (Based on per-question limits)'}
+                      </div>
+                    </div>
+
+                    <p className="text-xs text-slate-400 leading-relaxed">
+                      عند تفعيل موعد إغلاق حتمي، إذا دخل طالب متأخراً يتم تقليص الوقت المتبقي له ليناسب موعد الإغلاق، وعند حلول وقت النهاية يتم تسليم الاختبار لجميع الطلاب فوراً.
+                    </p>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setExamSettings((prev) => ({ ...prev, exam_end_time: null }))}
+                        className={`py-1.5 px-3 rounded-xl border text-xs font-semibold transition ${
+                          !examSettings.exam_end_time
+                            ? 'bg-purple-500/20 text-purple-300 border-purple-500/40'
+                            : 'bg-slate-800 text-slate-400 border-white/10 hover:bg-slate-700'
+                        }`}
+                      >
+                        بدون إغلاق حتمي
+                      </button>
+
+                      {[15, 30, 45, 60, 90, 120].map((mins) => (
+                        <button
+                          key={mins}
+                          type="button"
+                          onClick={() => {
+                            const baseTime = examSettings.exam_start_time
+                              ? new Date(examSettings.exam_start_time).getTime()
+                              : Date.now();
+                            const calculatedEnd = new Date(baseTime + mins * 60 * 1000).toISOString();
+                            setExamSettings((prev) => ({ ...prev, exam_end_time: calculatedEnd }));
+                          }}
+                          className={`py-1.5 px-3 rounded-xl border text-xs font-mono font-semibold transition ${
+                            examSettings.exam_end_time &&
+                            Math.round(
+                              (new Date(examSettings.exam_end_time).getTime() -
+                                (examSettings.exam_start_time ? new Date(examSettings.exam_start_time).getTime() : Date.now())) /
+                                60000
+                            ) === mins
+                              ? 'bg-purple-600 text-white border-purple-500 shadow-md'
+                              : 'bg-slate-800/80 text-slate-300 border-white/10 hover:bg-slate-700'
+                          }`}
+                        >
+                          <span dir="ltr" className="font-bold">+{mins}</span>
+                          <span> دقيقة (مدة الاختبار)</span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
 
                   {/* Save Button */}

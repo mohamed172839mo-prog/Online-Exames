@@ -23,7 +23,8 @@ import {
   Award,
   Flame,
   Zap,
-  Check
+  Check,
+  Lock
 } from 'lucide-react';
 
 interface QuestionResultDetail {
@@ -44,6 +45,9 @@ export default function ExamPage() {
   const [examTitle, setExamTitle] = useState<string>('اختبار تقييم المستوى');
   const [hasPriorAttempt, setHasPriorAttempt] = useState(false);
   const [priorAttemptData, setPriorAttemptData] = useState<ExamResult | null>(null);
+  const [isEntryLocked, setIsEntryLocked] = useState(false);
+  const [strictEndTime, setStrictEndTime] = useState<string | null>(null);
+  const [antiCheatWarning, setAntiCheatWarning] = useState<string | null>(null);
 
   // Exam Progression State
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -54,7 +58,51 @@ export default function ExamPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showReviewBreakdown, setShowReviewBreakdown] = useState(true);
 
-  // Load student info, check single-attempt, and load questions
+  // Refs for anti-cheat and robust event listener subscriptions without stale closures
+  const isAutoSkippingRef = useRef(false);
+  const currentIndexRef = useRef(0);
+  currentIndexRef.current = currentIndex;
+  const questionsRef = useRef<Question[]>([]);
+  questionsRef.current = questions;
+  const selectedAnswersRef = useRef<Record<number, string>>({});
+  selectedAnswersRef.current = selectedAnswers;
+  const timeRemainingRecordRef = useRef<Record<number, number>>({});
+  timeRemainingRecordRef.current = timeRemainingRecord;
+  const isExamCompletedRef = useRef(false);
+  isExamCompletedRef.current = isExamCompleted;
+  const isLoadingRef = useRef(true);
+  isLoadingRef.current = isLoading;
+  const studentRef = useRef<Student | null>(null);
+  studentRef.current = student;
+
+  // Supabase Realtime Presence: Track examinee as 'testing'
+  useEffect(() => {
+    if (!student?.phone_number) return;
+
+    const channel = supabase.channel('exam_live_presence', {
+      config: {
+        presence: { key: student.phone_number },
+      },
+    });
+
+    channel.subscribe(async (status) => {
+      if (status === 'SUBSCRIBED') {
+        await channel.track({
+          user_name: student.full_name,
+          phone: student.phone_number,
+          status: isExamCompleted ? 'completed' : 'testing',
+          updated_at: new Date().toISOString(),
+        });
+      }
+    });
+
+    return () => {
+      channel.untrack();
+      supabase.removeChannel(channel);
+    };
+  }, [student, isExamCompleted]);
+
+  // Load student info, check single-attempt, entry lock, strict window, and load questions
   useEffect(() => {
     let parsedStudent: Student | null = null;
     if (typeof window !== 'undefined') {
@@ -77,15 +125,31 @@ export default function ExamPage() {
     const checkAttemptAndFetchQuestions = async () => {
       setIsLoading(true);
       try {
-        // Fetch exam settings to get title if not cached
+        // Fetch exam settings to check title, lock state, and strict cutoff
         try {
           const { data: settingsData } = await supabase
             .from('exam_settings')
-            .select('exam_title')
+            .select('*')
             .limit(1)
             .maybeSingle();
-          if (settingsData?.exam_title) {
-            setExamTitle(settingsData.exam_title);
+
+          if (settingsData) {
+            if (settingsData.exam_title) {
+              setExamTitle(settingsData.exam_title);
+            }
+            if (settingsData.is_locked) {
+              setIsEntryLocked(true);
+              setIsLoading(false);
+              return;
+            }
+            if (settingsData.exam_end_time) {
+              setStrictEndTime(settingsData.exam_end_time);
+              if (new Date() >= new Date(settingsData.exam_end_time)) {
+                setIsEntryLocked(true);
+                setIsLoading(false);
+                return;
+              }
+            }
           }
         } catch (e) {
           // ignore
@@ -107,7 +171,6 @@ export default function ExamPage() {
                 localStorage.getItem(`allow_retake_${parsedStudent.phone_number}`) === 'true';
 
               if (latest.allow_retake || localRetakeAllowed) {
-                // Admin permitted retake! Clear lock and allow examination
                 setHasPriorAttempt(false);
                 if (typeof window !== 'undefined') {
                   localStorage.removeItem(`completed_exam_${parsedStudent.phone_number}`);
@@ -121,6 +184,23 @@ export default function ExamPage() {
             }
           } catch (e) {
             console.warn('Past attempts check bypassed:', e);
+          }
+        }
+
+        // Restore in-progress session if student refreshed after anti-cheat auto-skip
+        if (parsedStudent?.phone_number && typeof window !== 'undefined') {
+          const savedProgress = sessionStorage.getItem(`exam_session_${parsedStudent.phone_number}`);
+          if (savedProgress) {
+            try {
+              const parsed = JSON.parse(savedProgress);
+              if (parsed && typeof parsed.currentIndex === 'number') {
+                setCurrentIndex(parsed.currentIndex);
+                if (parsed.selectedAnswers) setSelectedAnswers(parsed.selectedAnswers);
+                if (parsed.timeRemainingRecord) setTimeRemainingRecord(parsed.timeRemainingRecord);
+              }
+            } catch (e) {
+              // ignore
+            }
           }
         }
 
@@ -144,14 +224,121 @@ export default function ExamPage() {
     checkAttemptAndFetchQuestions();
   }, []);
 
-  // Timer Effect
+  // Anti-Cheat Auto-Skip Handler: advances immediately, marks current as skipped, persists state
+  const handleAntiCheatAutoSkip = (reason: string) => {
+    const activeIdx = currentIndexRef.current;
+    const currentQList = questionsRef.current;
+    if (activeIdx >= currentQList.length || isExamCompletedRef.current) return;
+
+    const updatedAnswers = {
+      ...selectedAnswersRef.current,
+      [activeIdx]: 'تم التخطي تلقائياً (رصد مغادرة شاشة الاختبار)',
+    };
+    const updatedTimes = {
+      ...timeRemainingRecordRef.current,
+      [activeIdx]: 0,
+    };
+
+    setSelectedAnswers(updatedAnswers);
+    setTimeRemainingRecord(updatedTimes);
+    setAntiCheatWarning('⚠️ تم تخطي السؤال تلقائياً بسبب مغادرة شاشة الاختبار أو التبديل بين التطبيقات (نظام حماية النزاهة).');
+
+    setTimeout(() => {
+      setAntiCheatWarning(null);
+    }, 5000);
+
+    const st = studentRef.current;
+    if (typeof window !== 'undefined' && st?.phone_number) {
+      sessionStorage.setItem(
+        `exam_session_${st.phone_number}`,
+        JSON.stringify({
+          currentIndex: activeIdx + 1,
+          selectedAnswers: updatedAnswers,
+          timeRemainingRecord: updatedTimes,
+        })
+      );
+    }
+
+    if (activeIdx < currentQList.length - 1) {
+      const nextIdx = activeIdx + 1;
+      setCurrentIndex(nextIdx);
+      setTimeLeft(currentQList[nextIdx].time_limit || 60);
+    } else {
+      finishExam(updatedTimes);
+    }
+  };
+
+  // Mobile & Browser Anti-Cheat Listeners: visibilitychange, blur, pagehide
+  useEffect(() => {
+    if (isExamCompleted || isLoading || questions.length === 0) return;
+
+    isAutoSkippingRef.current = false;
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (!isAutoSkippingRef.current && !isExamCompletedRef.current && !isLoadingRef.current) {
+          isAutoSkippingRef.current = true;
+          handleAntiCheatAutoSkip('visibilitychange');
+        }
+      }
+    };
+
+    const onBlur = () => {
+      if (!isAutoSkippingRef.current && !isExamCompletedRef.current && !isLoadingRef.current) {
+        isAutoSkippingRef.current = true;
+        handleAntiCheatAutoSkip('blur');
+      }
+    };
+
+    const onPageHide = () => {
+      if (!isAutoSkippingRef.current && !isExamCompletedRef.current && !isLoadingRef.current) {
+        isAutoSkippingRef.current = true;
+        handleAntiCheatAutoSkip('pagehide');
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('blur', onBlur);
+    window.addEventListener('pagehide', onPageHide);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('blur', onBlur);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, [currentIndex, isExamCompleted, isLoading, questions.length]);
+
+  // Timer & Strict Cutoff Effect
   useEffect(() => {
     if (isExamCompleted || isLoading || questions.length === 0) return;
 
     const timer = setInterval(() => {
+      // Check strict cutoff time
+      if (strictEndTime) {
+        const endMs = new Date(strictEndTime).getTime();
+        const nowMs = Date.now();
+        if (nowMs >= endMs) {
+          clearInterval(timer);
+          finishExam(timeRemainingRecordRef.current);
+          return;
+        }
+      }
+
       setTimeLeft((prev) => {
+        if (strictEndTime) {
+          const endMs = new Date(strictEndTime).getTime();
+          const nowMs = Date.now();
+          const secondsUntilStrictEnd = Math.max(0, Math.floor((endMs - nowMs) / 1000));
+          if (secondsUntilStrictEnd <= 1) {
+            handleAutoAdvance(0);
+            return 0;
+          }
+          if (secondsUntilStrictEnd < prev) {
+            return secondsUntilStrictEnd;
+          }
+        }
+
         if (prev <= 1) {
-          // Timer expired: auto-advance
           handleAutoAdvance(0);
           return 0;
         }
@@ -160,20 +347,31 @@ export default function ExamPage() {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [currentIndex, isExamCompleted, isLoading, questions.length, selectedAnswers]);
+  }, [currentIndex, isExamCompleted, isLoading, questions.length, strictEndTime]);
 
   const handleAutoAdvance = (remainingSecondsAtExpire: number) => {
-    setTimeRemainingRecord((prev) => ({
-      ...prev,
+    const updatedTimeRecord = {
+      ...timeRemainingRecord,
       [currentIndex]: remainingSecondsAtExpire,
-    }));
+    };
+    setTimeRemainingRecord(updatedTimeRecord);
 
     if (currentIndex < questions.length - 1) {
       const nextIdx = currentIndex + 1;
+      if (typeof window !== 'undefined' && student?.phone_number) {
+        sessionStorage.setItem(
+          `exam_session_${student.phone_number}`,
+          JSON.stringify({
+            currentIndex: nextIdx,
+            selectedAnswers,
+            timeRemainingRecord: updatedTimeRecord,
+          })
+        );
+      }
       setCurrentIndex(nextIdx);
       setTimeLeft(questions[nextIdx].time_limit || 60);
     } else {
-      finishExam({ ...timeRemainingRecord, [currentIndex]: remainingSecondsAtExpire });
+      finishExam(updatedTimeRecord);
     }
   };
 
@@ -194,6 +392,16 @@ export default function ExamPage() {
 
     if (currentIndex < questions.length - 1) {
       const nextIdx = currentIndex + 1;
+      if (typeof window !== 'undefined' && student?.phone_number) {
+        sessionStorage.setItem(
+          `exam_session_${student.phone_number}`,
+          JSON.stringify({
+            currentIndex: nextIdx,
+            selectedAnswers,
+            timeRemainingRecord: updatedTimeRecord,
+          })
+        );
+      }
       setCurrentIndex(nextIdx);
       setTimeLeft(questions[nextIdx].time_limit || 60);
     } else {
@@ -249,15 +457,20 @@ export default function ExamPage() {
       let bonusPoints = 0;
       let totalPointsAwarded = 0;
 
-      if (!studentAns) {
+      if (!studentAns || studentAns.includes('تم التخطي')) {
         isUnanswered = true;
       } else {
         isCorrect = checkIsCorrect(q, studentAns);
         if (isCorrect) {
           correctCount++;
-          bonusPoints = Math.max(0, remainingSeconds);
+          // Accuracy over speed rule: Math.floor(remainingSeconds / 2)
+          // Speed bonus points are ONLY awarded if the question's answer is correct
+          bonusPoints = Math.floor(Math.max(0, remainingSeconds) / 2);
           totalPointsAwarded = basePoints + bonusPoints;
           totalScore += totalPointsAwarded;
+        } else {
+          bonusPoints = 0;
+          totalPointsAwarded = 0;
         }
       }
 
@@ -316,12 +529,43 @@ export default function ExamPage() {
       setIsSubmitting(false);
     }
 
-    // Save anti-cheat lock flag in localStorage and clear temporary retake permission
+    // Save anti-cheat lock flag in localStorage and clear temporary retake permission & session
     if (typeof window !== 'undefined' && student?.phone_number) {
       localStorage.setItem(`completed_exam_${student.phone_number}`, 'true');
       localStorage.removeItem(`allow_retake_${student.phone_number}`);
+      sessionStorage.removeItem(`exam_session_${student.phone_number}`);
     }
   };
+
+  // Render: Locked Entry Screen (when admin locks exam entry or strict cutoff passed)
+  if (isEntryLocked) {
+    return (
+      <div dir="rtl" className="min-h-screen bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 text-white flex flex-col items-center justify-center p-4 sm:p-6 font-sans text-right">
+        <div className="max-w-md w-full bg-slate-800/80 backdrop-blur-xl border border-rose-500/40 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-4 text-center">
+          <div className="w-14 h-14 rounded-2xl bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto border border-rose-500/40">
+            <Lock className="w-8 h-8" />
+          </div>
+          <h2 className="text-xl font-bold text-white">باب الدخول مغلق</h2>
+          <p className="text-xs text-rose-200 leading-relaxed font-semibold">
+            عذراً، تم إغلاق باب الدخول للامتحان.
+          </p>
+          <p className="text-xs text-slate-400">
+            تم إغلاق استقبال الممتحنين لهذه الجلسة أو انتهت المهلة المحددة للدخول.
+          </p>
+
+          <div className="pt-2">
+            <Link
+              href="/"
+              className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-slate-700/70 hover:bg-slate-700 py-3 px-4 font-semibold text-xs sm:text-sm text-slate-200 transition min-h-[48px] touch-manipulation"
+            >
+              <ArrowRight className="w-4 h-4" />
+              <span>العودة إلى الصفحة الرئيسية</span>
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // Render: Blocked Re-Entry Screen (Anti-Cheat Single Attempt Enforcement)
   if (hasPriorAttempt && priorAttemptData) {
@@ -464,7 +708,7 @@ export default function ExamPage() {
                 <span className="text-base sm:text-lg font-bold text-amber-400 ml-1.5">PTS</span>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
-                تشمل النقاط الأساسية لكل سؤال + نقاط المكافأة الإضافية لكل ثانية متبقية
+                تشمل النقاط الأساسية لكل سؤال + نقاط مكافأة السرعة (نصف الثواني المتبقية للإجابات الصحيحة فقط)
               </p>
             </div>
 
@@ -548,14 +792,14 @@ export default function ExamPage() {
                       {/* Question Header & Points Earned Tag */}
                       <div className="flex flex-wrap items-start justify-between gap-2">
                         <div dir="auto" className="font-semibold text-white text-sm leading-relaxed [unicode-bidi:plaintext] flex-1 min-w-[200px] break-words">
-                          <span className="text-slate-500 font-mono ml-2">س{idx + 1}.</span>
+                          <span className="text-slate-500 font-mono ml-2"><bdi dir="ltr">س{idx + 1}.</bdi></span>
                           {q.text}
                         </div>
 
                         {detail.isCorrect ? (
                           <div className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[11px] font-bold">
                             <Zap className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
-                            <span>+{detail.totalPointsAwarded} نقطة</span>
+                            <span><bdi dir="ltr">+{detail.totalPointsAwarded}</bdi> نقطة</span>
                           </div>
                         ) : (
                           <div className="shrink-0 px-2.5 py-1 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/30 text-[11px] font-bold">
@@ -587,8 +831,8 @@ export default function ExamPage() {
                         </div>
 
                         {detail.isCorrect && (
-                          <div className="text-slate-400">
-                            (الأساس: {detail.basePoints} + مكافأة السرعة: {detail.bonusPoints} نقطة)
+                          <div className="text-slate-400" dir="rtl">
+                            (الأساس: <bdi dir="ltr">{detail.basePoints}</bdi> + مكافأة السرعة: <bdi dir="ltr">{detail.bonusPoints}</bdi> نقطة)
                           </div>
                         )}
                       </div>
@@ -631,7 +875,7 @@ export default function ExamPage() {
         </div>
 
         <div className="flex items-center gap-2">
-          <span className="text-xs px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 font-mono">
+          <span dir="ltr" className="text-xs px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 font-mono">
             {currentIndex + 1} / {questions.length}
           </span>
         </div>
@@ -640,6 +884,14 @@ export default function ExamPage() {
       {/* Main Question Flow Container */}
       <main className="w-full max-w-2xl mx-auto my-3 sm:my-6 space-y-4 sm:space-y-5 px-1 sm:px-0">
         
+        {/* Anti-Cheat Warning Banner */}
+        {antiCheatWarning && (
+          <div className="p-3.5 sm:p-4 rounded-2xl bg-rose-500/20 border border-rose-500/50 text-rose-200 text-xs font-semibold flex items-center gap-2.5 shadow-lg shadow-rose-950/40 animate-in fade-in slide-in-from-top-2">
+            <ShieldAlert className="w-5 h-5 text-rose-400 shrink-0 animate-bounce" />
+            <span className="leading-relaxed">{antiCheatWarning}</span>
+          </div>
+        )}
+
         {/* PROMINENT MOBILE-OPTIMIZED COUNTDOWN TIMER CARD */}
         <div className={`relative overflow-hidden rounded-2xl p-3.5 sm:p-4 transition-all duration-300 border backdrop-blur-xl shadow-xl flex items-center justify-between ${
           isTimerCritical
@@ -680,7 +932,7 @@ export default function ExamPage() {
                 )}
               </div>
               <div className="text-[10px] sm:text-[11px] text-slate-400 mt-0.5 truncate">
-                كل ثانية متبقية تمنحك +1 نقطة إضافية
+                كل ثانيتين متبقيتين تمنحانك <bdi dir="ltr">+1</bdi> نقطة إضافية عند الإجابة الصحيحة
               </div>
             </div>
           </div>
@@ -706,8 +958,8 @@ export default function ExamPage() {
         <div className="space-y-1.5">
           <div className="flex items-center justify-between text-[11px] sm:text-xs text-slate-400 font-medium">
             <span>
-              السؤال <strong className="text-white font-mono">{currentIndex + 1}</strong> من{' '}
-              <strong className="text-white font-mono">{questions.length}</strong>
+              السؤال <strong className="text-white font-mono"><bdi dir="ltr">{currentIndex + 1}</bdi></strong> من{' '}
+              <strong className="text-white font-mono"><bdi dir="ltr">{questions.length}</bdi></strong>
             </span>
             <span dir="ltr">{Math.round(((currentIndex + 1) / questions.length) * 100)}% Complete</span>
           </div>
@@ -723,7 +975,7 @@ export default function ExamPage() {
         <div className="bg-slate-800/80 backdrop-blur-xl border border-white/10 rounded-2xl p-4 sm:p-7 shadow-2xl space-y-5">
           <div className="space-y-2">
             <span className="inline-block text-[10px] sm:text-[11px] font-semibold px-2 py-0.5 rounded-md bg-blue-500/10 text-blue-400 border border-blue-500/20">
-              السؤال #{currentIndex + 1}
+              السؤال <bdi dir="ltr">#{currentIndex + 1}</bdi>
             </span>
             
             {/* Question Text with unicode-bidi support for mixed Arabic & English */}

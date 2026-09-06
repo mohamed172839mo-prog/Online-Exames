@@ -33,11 +33,13 @@ export default function StudentOnboarding() {
   // Exam Scheduling State
   const [settings, setSettings] = useState<ExamSettings>({
     is_enabled: true,
+    is_locked: false,
     allowed_entry_window_minutes: 10,
     exam_start_time: null,
+    exam_end_time: null,
   });
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
-  const [windowStatus, setWindowStatus] = useState<'open' | 'not_started' | 'closed' | 'disabled'>('open');
+  const [windowStatus, setWindowStatus] = useState<'open' | 'not_started' | 'closed' | 'disabled' | 'locked'>('open');
   const [countdownText, setCountdownText] = useState<string>('');
 
   // Fetch Settings on mount and poll
@@ -53,8 +55,10 @@ export default function StudentOnboarding() {
         setSettings({
           exam_title: data.exam_title || 'اختبار تقييم المستوى',
           is_enabled: data.is_enabled ?? true,
+          is_locked: data.is_locked ?? false,
           allowed_entry_window_minutes: data.allowed_entry_window_minutes || 10,
           exam_start_time: data.exam_start_time || null,
+          exam_end_time: data.exam_end_time || null,
         });
       } else {
         // Fallback to local settings if table not created
@@ -76,9 +80,45 @@ export default function StudentOnboarding() {
     fetchSettings();
     const interval = setInterval(() => {
       fetchSettings();
-    }, 15000);
+    }, 10000);
     return () => clearInterval(interval);
   }, []);
+
+  // Supabase Realtime Presence: Track examinees in Waiting Room ('waiting')
+  useEffect(() => {
+    const studentIdentifier =
+      successStudent?.phone_number ||
+      phoneNumber.trim() ||
+      (typeof window !== 'undefined'
+        ? localStorage.getItem('waiting_candidate_id') || Math.random().toString().slice(2, 8)
+        : 'guest');
+
+    if (typeof window !== 'undefined' && !localStorage.getItem('waiting_candidate_id')) {
+      localStorage.setItem('waiting_candidate_id', studentIdentifier);
+    }
+
+    const channel = supabase.channel('exam_live_presence', {
+      config: {
+        presence: { key: studentIdentifier },
+      },
+    });
+
+    channel.subscribe(async (status) => {
+      if (status === 'SUBSCRIBED') {
+        await channel.track({
+          user_name: successStudent?.full_name || fullName.trim() || 'طالب في الانتظار',
+          phone: studentIdentifier,
+          status: 'waiting',
+          updated_at: new Date().toISOString(),
+        });
+      }
+    });
+
+    return () => {
+      channel.untrack();
+      supabase.removeChannel(channel);
+    };
+  }, [successStudent, fullName, phoneNumber]);
 
   // Time & Window Evaluation Effect (ticks every second)
   useEffect(() => {
@@ -86,8 +126,19 @@ export default function StudentOnboarding() {
       const now = new Date();
       setCurrentTime(now);
 
+      if (settings.is_locked) {
+        setWindowStatus('locked');
+        return;
+      }
+
       if (!settings.is_enabled) {
         setWindowStatus('disabled');
+        return;
+      }
+
+      // Check strict cutoff time if configured
+      if (settings.exam_end_time && now >= new Date(settings.exam_end_time)) {
+        setWindowStatus('closed');
         return;
       }
 
@@ -99,7 +150,9 @@ export default function StudentOnboarding() {
 
       const startTime = new Date(settings.exam_start_time);
       const windowMinutes = settings.allowed_entry_window_minutes || 10;
-      const endTime = new Date(startTime.getTime() + windowMinutes * 60 * 1000);
+      const endTime = settings.exam_end_time
+        ? new Date(settings.exam_end_time)
+        : new Date(startTime.getTime() + windowMinutes * 60 * 1000);
 
       if (now < startTime) {
         setWindowStatus('not_started');
@@ -127,6 +180,10 @@ export default function StudentOnboarding() {
     setBlockedAttempt(null);
 
     // Verify window
+    if (windowStatus === 'locked') {
+      setErrorMessage('عذراً، تم إغلاق باب الدخول للامتحان من قِبل المشرف.');
+      return;
+    }
     if (windowStatus === 'disabled') {
       setErrorMessage('الاختبار مغلق حالياً من قِبل إدارة الامتحانات.');
       return;
@@ -263,6 +320,12 @@ export default function StudentOnboarding() {
               قريباً
             </span>
           )}
+          {windowStatus === 'locked' && (
+            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 text-xs font-semibold">
+              <Lock className="w-3.5 h-3.5" />
+              باب الدخول مغلق
+            </span>
+          )}
           {(windowStatus === 'closed' || windowStatus === 'disabled') && (
             <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 text-xs font-semibold">
               <Lock className="w-3.5 h-3.5" />
@@ -275,6 +338,17 @@ export default function StudentOnboarding() {
       {/* Main Content Area */}
       <main className="w-full max-w-md mx-auto my-4 sm:my-8 px-1 sm:px-0">
         {/* TIME WINDOW BANNER NOTICES */}
+        {windowStatus === 'locked' && (
+          <div className="mb-4 p-4 rounded-2xl bg-rose-950/40 border border-rose-500/40 text-rose-200 text-center space-y-2">
+            <div className="w-10 h-10 rounded-xl bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto">
+              <Lock className="w-5 h-5" />
+            </div>
+            <h3 className="font-bold text-sm text-rose-100">باب الدخول مغلق</h3>
+            <p className="text-xs text-rose-300/90 leading-relaxed font-semibold">
+              عذراً، تم إغلاق باب الدخول للامتحان من قِبل المشرف.
+            </p>
+          </div>
+        )}
         {windowStatus === 'not_started' && (
           <div className="mb-4 p-4 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-amber-200 text-center space-y-2">
             <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center mx-auto">
@@ -479,13 +553,24 @@ export default function StudentOnboarding() {
                 <span>تعديل البيانات</span>
               </button>
 
-              <Link
-                href="/exam"
-                className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 py-3.5 px-4 font-semibold text-xs sm:text-sm text-white shadow-lg shadow-emerald-600/30 transition text-center min-h-[48px] touch-manipulation"
-              >
-                <span>دخول قاعة الاختبار</span>
-                <ArrowLeft className="w-4 h-4" />
-              </Link>
+              {windowStatus === 'locked' ? (
+                <button
+                  type="button"
+                  onClick={() => alert('عذراً، تم إغلاق باب الدخول للامتحان من قِبل المشرف.')}
+                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-rose-600/40 cursor-not-allowed py-3.5 px-4 font-semibold text-xs sm:text-sm text-rose-200 border border-rose-500/40 text-center min-h-[48px] touch-manipulation"
+                >
+                  <Lock className="w-4 h-4" />
+                  <span>باب الدخول مغلق</span>
+                </button>
+              ) : (
+                <Link
+                  href="/exam"
+                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 py-3.5 px-4 font-semibold text-xs sm:text-sm text-white shadow-lg shadow-emerald-600/30 transition text-center min-h-[48px] touch-manipulation"
+                >
+                  <span>دخول قاعة الاختبار</span>
+                  <ArrowLeft className="w-4 h-4" />
+                </Link>
+              )}
             </div>
           </div>
         )}
